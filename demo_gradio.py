@@ -44,34 +44,41 @@ model = model.to(device)
 def run_model(target_dir, model) -> dict:
     """
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
+    This modified version WILL:
+      - compute intrinsics & extrinsics (same as original)
+      - print intrinsics & extrinsics to stdout (console)
+      - save a human-readable camera_params.txt in target_dir
+      - return predictions (numpy arrays where relevant) exactly like before
+
+    Drop-in replacement for the existing run_model(...) in your demo.
     """
     print(f"Processing images from {target_dir}")
 
-    # Device check
+    # Device check (same as original code expectation)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if not torch.cuda.is_available():
         raise ValueError("CUDA is not available. Check your environment.")
 
-    # Move model to device
+    # Ensure the model is on the right device and in eval mode
     model = model.to(device)
     model.eval()
 
-    # Load and preprocess images
+    # Load images from folder
     image_names = glob.glob(os.path.join(target_dir, "images", "*"))
     image_names = sorted(image_names)
     print(f"Found {len(image_names)} images")
     if len(image_names) == 0:
         raise ValueError("No images found. Check your upload.")
 
+    # Preprocess images (uses your existing util)
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images shape: {images.shape}")
 
-    # Run inference
-    print("Running inference...")
+    # Run inference with mixed precision (same heuristic as original)
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
+            print("Running inference...")
             predictions = model(images)
 
     # Convert pose encoding to extrinsic and intrinsic matrices
@@ -80,21 +87,92 @@ def run_model(target_dir, model) -> dict:
     predictions["extrinsic"] = extrinsic
     predictions["intrinsic"] = intrinsic
 
-    # Convert tensors to numpy
-    for key in predictions.keys():
-        if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
-    predictions['pose_enc_list'] = None # remove pose_enc_list
+    # Convert torch tensors in predictions -> numpy and remove batch dim where appropriate
+    for key in list(predictions.keys()):
+        v = predictions[key]
+        if isinstance(v, torch.Tensor):
+            # keep same semantic as original: move to cpu, numpy, squeeze batch dim if present
+            try:
+                arr = v.cpu().numpy()
+                # if first dimension is batch dim of size 1, remove it
+                if arr.ndim > 0 and arr.shape[0] == 1:
+                    arr = arr.squeeze(0)
+                predictions[key] = arr
+            except Exception:
+                # fallback — keep as-is if conversion fails (shouldn't happen)
+                predictions[key] = v
 
-    # Generate world points from depth map
-    print("Computing world points from depth map...")
-    depth_map = predictions["depth"]  # (S, H, W, 1)
-    world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
-    predictions["world_points_from_depth"] = world_points
+    # If pose_enc_list exists, remove it to keep smaller saved state (original code did this)
+    if "pose_enc_list" in predictions:
+        predictions["pose_enc_list"] = None
 
-    # Clean up
+    # --- PRINT and SAVE human-readable intrinsics & extrinsics ---
+    try:
+        np.set_printoptions(precision=6, suppress=True)
+        intr = predictions.get("intrinsic", None)
+        extr = predictions.get("extrinsic", None)
+
+        if intr is None or extr is None:
+            print("Warning: intrinsic or extrinsic not found in predictions.")
+        else:
+            # Determine number of cameras/frames available (handle shapes safely)
+            # intr shape: (S, 3, 3) or (S, ...) ; extr shape: (S, 4, 4) or similar
+            n_intr = intr.shape[0] if hasattr(intr, "shape") and len(intr.shape) >= 1 else 1
+            n_extr = extr.shape[0] if hasattr(extr, "shape") and len(extr.shape) >= 1 else 1
+            n_cams = min(n_intr, n_extr)
+
+            cam_txt_path = os.path.join(target_dir, "camera_params.txt")
+            lines = []
+            lines.append(f"VGGT camera parameters (generated {datetime.now().isoformat()})\n\n")
+
+            for i in range(n_cams):
+                lines.append(f"=== Camera {i} ===\n")
+                # Intrinsic matrix (K)
+                try:
+                    K = intr[i]
+                except Exception:
+                    K = intr  # fallback if intr not indexed
+                lines.append("Intrinsic (K):\n")
+                lines.append(np.array2string(np.array(K), separator=", "))
+                lines.append("\n")
+                # Extrinsic matrix
+                try:
+                    E = extr[i]
+                except Exception:
+                    E = extr
+                lines.append("Extrinsic (camera-from-world matrix):\n")
+                lines.append(np.array2string(np.array(E), separator=", "))
+                lines.append("\n\n")
+                # Print to console as well
+                print(f"--- Camera {i} ---")
+                print("K:\n", np.array(K))
+                print("Extrinsic:\n", np.array(E))
+
+            # Write to file
+            try:
+                with open(cam_txt_path, "w") as f:
+                    f.writelines(line if isinstance(line, str) else str(line) for line in lines)
+                print(f"Saved human-readable camera params to: {cam_txt_path}")
+            except Exception as e:
+                print("Failed to save camera params file:", e)
+    except Exception as e:
+        print("Error while preparing/saving camera params:", e)
+
+    # Generate world points from depth map (same as original)
+    try:
+        print("Computing world points from depth map...")
+        depth_map = predictions["depth"]  # expected shape (S, H, W, 1) or (S, H, W)
+        world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
+        predictions["world_points_from_depth"] = world_points
+    except Exception as e:
+        print("Warning: failed to compute world points from depth:", e)
+        # don't crash the whole pipeline; still return predictions (user can inspect camera file)
+        predictions["world_points_from_depth"] = None
+
+    # final cleanup
     torch.cuda.empty_cache()
     return predictions
+
 
 
 # -------------------------------------------------------------------------
