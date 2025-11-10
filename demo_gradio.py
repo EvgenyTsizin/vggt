@@ -1,20 +1,24 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Full Gradio app with "save everything & zip" export (no images).
+# Saves: cameras (npz/txt/json), depth maps + conf (npy), points (ply/npy),
+# full results (npz), summary (json), and a downloadable ZIP.
+# Also prints/shows the export folder in the UI.
 
 import os
-import cv2
-import torch
-import numpy as np
-import gradio as gr
 import sys
-import shutil
-from datetime import datetime
-import glob
 import gc
+import cv2
 import time
+import json
+import glob
+import shutil
+import numpy as np
+import torch
+import gradio as gr
+from datetime import datetime
+from pathlib import Path
 
 sys.path.append("vggt/")
 
@@ -27,172 +31,240 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print("Initializing and loading VGGT model...")
-# model = VGGT.from_pretrained("facebook/VGGT-1B")  # another way to load the model
-
 model = VGGT()
 _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
 model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-
-
 model.eval()
 model = model.to(device)
+
+
+# -------------------------------------------------------------------------
+# Exporter: save all requested artifacts and zip them (no images)
+# -------------------------------------------------------------------------
+def save_and_zip_results(target_dir: str, predictions: dict, conf_thres_percent: float = 50.0):
+    """
+    Save full reconstruction results (excluding images) into <target_dir>/export/
+    and zip them. Returns (export_dir, zip_path).
+
+    Saved content:
+      export/
+        cameras/
+          cameras.npz            # intrinsic, extrinsic
+          camera_params.txt      # human-readable
+          cameras.json           # JSON copy (quick view)
+        depth/
+          depth_XXXX.npy         # per-frame depth (float32)
+          conf_XXXX.npy          # per-frame depth confidence (float32)
+          depth_meta.json        # shape info + stats
+        points/
+          points.ply             # point cloud (geometry-only)
+          points.npy             # Nx3 numpy array (float32)
+        meta/
+          results.npz            # full predictions (intrinsic, extrinsic, depth, depth_conf, world_points_from_depth)
+          summary.json           # sizes, counts, thresholds used
+    """
+    target_dir = str(target_dir)
+    export_dir = os.path.join(target_dir, "export")
+    cams_dir   = os.path.join(export_dir, "cameras")
+    depth_dir  = os.path.join(export_dir, "depth")
+    points_dir = os.path.join(export_dir, "points")
+    meta_dir   = os.path.join(export_dir, "meta")
+    for d in (cams_dir, depth_dir, points_dir, meta_dir):
+        os.makedirs(d, exist_ok=True)
+
+    # --- grab arrays safely ---
+    K = predictions.get("intrinsic", None)
+    E = predictions.get("extrinsic", None)
+    depth = predictions.get("depth", None)                  # [S,H,W] or [S,H,W,1]
+    depth_conf = predictions.get("depth_conf", None)        # [S,H,W]
+    wp = predictions.get("world_points_from_depth", None)   # [S,H,W,3] if present
+
+    # --- normalize shapes ---
+    if depth is not None:
+        depth = np.array(depth)
+        if depth.ndim == 4 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        depth = depth.astype(np.float32, copy=False)
+
+    if depth_conf is not None:
+        depth_conf = np.array(depth_conf).astype(np.float32, copy=False)
+
+    # --- cameras: save npz, txt, json ---
+    cam_npz = os.path.join(cams_dir, "cameras.npz")
+    np.savez(cam_npz, intrinsic=np.array(K), extrinsic=np.array(E))
+
+    cam_txt = os.path.join(cams_dir, "camera_params.txt")
+    with open(cam_txt, "w") as f:
+        f.write("=== Intrinsic (K) ===\n")
+        f.write(repr(np.array(K)) + "\n\n")
+        f.write("=== Extrinsic (camera-from-world) ===\n")
+        f.write(repr(np.array(E)) + "\n")
+
+    cam_json = os.path.join(cams_dir, "cameras.json")
+    with open(cam_json, "w") as f:
+        json.dump({
+            "intrinsic": np.array(K).tolist() if K is not None else None,
+            "extrinsic": np.array(E).tolist() if E is not None else None
+        }, f, indent=2)
+
+    # --- depth: save per-frame .npy + meta ---
+    if depth is not None:
+        S = depth.shape[0]
+        for i in range(S):
+            np.save(os.path.join(depth_dir, f"depth_{i:04d}.npy"), depth[i])
+        depth_min = float(np.nanmin(depth)) if depth.size else None
+        depth_max = float(np.nanmax(depth)) if depth.size else None
+        depth_mean = float(np.nanmean(depth)) if depth.size else None
+
+        if depth_conf is not None and depth_conf.shape[:3] == depth.shape[:3]:
+            for i in range(S):
+                np.save(os.path.join(depth_dir, f"conf_{i:04d}.npy"), depth_conf[i])
+
+        with open(os.path.join(depth_dir, "depth_meta.json"), "w") as f:
+            json.dump({
+                "frames": int(S),
+                "shape_per_frame": list(depth.shape[1:]),
+                "stats": {"min": depth_min, "max": depth_max, "mean": depth_mean}
+            }, f, indent=2)
+
+    # --- points: build from world_points_from_depth if present ---
+    pts_npy_path = os.path.join(points_dir, "points.npy")
+    pts_ply_path = os.path.join(points_dir, "points.ply")
+    saved_points = False
+    if wp is not None:
+        wp = np.array(wp)
+        pts = wp.reshape(-1, 3)
+        mask = np.isfinite(pts).all(axis=1)
+        if depth_conf is not None and depth is not None:
+            conf = depth_conf.reshape(-1)
+            valid_conf = conf[np.isfinite(conf)]
+            if valid_conf.size > 0:
+                th = np.percentile(valid_conf, conf_thres_percent)
+                mask &= (conf >= th)
+        pts = pts[mask]
+        # store numpy
+        np.save(pts_npy_path, pts.astype(np.float32, copy=False))
+        # write PLY
+        try:
+            import trimesh
+            trimesh.PointCloud(pts.astype(np.float32, copy=False)).export(pts_ply_path)
+            saved_points = True
+        except Exception:
+            # simple ASCII PLY fallback
+            try:
+                with open(pts_ply_path, "w") as f:
+                    f.write("ply\nformat ascii 1.0\nelement vertex {}\n".format(pts.shape[0]))
+                    f.write("property float x\nproperty float y\nproperty float z\nend_header\n")
+                    for p in pts:
+                        f.write(f"{p[0]} {p[1]} {p[2]}\n")
+                saved_points = True
+            except Exception:
+                saved_points = False
+
+    # --- meta: full NPZ & summary ---
+    results_npz = os.path.join(meta_dir, "results.npz")
+    np.savez_compressed(
+        results_npz,
+        intrinsic=np.array(K) if K is not None else None,
+        extrinsic=np.array(E) if E is not None else None,
+        depth=depth if depth is not None else None,
+        depth_conf=depth_conf if depth_conf is not None else None,
+        world_points_from_depth=np.array(wp) if wp is not None else None
+    )
+
+    summary = {
+        "export_dir": export_dir,
+        "saved": {
+            "cameras_npz": cam_npz,
+            "camera_params_txt": cam_txt,
+            "cameras_json": cam_json,
+            "depth_dir": depth_dir if depth is not None else None,
+            "points_ply": pts_ply_path if saved_points else None,
+            "points_npy": pts_npy_path if os.path.exists(pts_npy_path) else None,
+            "results_npz": results_npz
+        },
+        "thresholds": {
+            "conf_thres_percent": conf_thres_percent
+        }
+    }
+    with open(os.path.join(meta_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # --- zip it ---
+    zip_base = os.path.join(target_dir, os.path.basename(target_dir) + "_export")
+    zip_path = shutil.make_archive(zip_base, "zip", root_dir=export_dir)
+    return export_dir, zip_path
 
 
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
 def run_model(target_dir, model) -> dict:
-    """
-    Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
-    This modified version WILL:
-      - compute intrinsics & extrinsics (same as original)
-      - print intrinsics & extrinsics to stdout (console)
-      - save a human-readable camera_params.txt in target_dir
-      - return predictions (numpy arrays where relevant) exactly like before
-
-    Drop-in replacement for the existing run_model(...) in your demo.
-    """
     print(f"Processing images from {target_dir}")
-
-    # Device check (same as original code expectation)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     if not torch.cuda.is_available():
         raise ValueError("CUDA is not available. Check your environment.")
 
-    # Ensure the model is on the right device and in eval mode
     model = model.to(device)
     model.eval()
 
-    # Load images from folder
     image_names = glob.glob(os.path.join(target_dir, "images", "*"))
     image_names = sorted(image_names)
     print(f"Found {len(image_names)} images")
     if len(image_names) == 0:
         raise ValueError("No images found. Check your upload.")
 
-    # Preprocess images (uses your existing util)
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images shape: {images.shape}")
 
-    # Run inference with mixed precision (same heuristic as original)
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             print("Running inference...")
             predictions = model(images)
 
-    # Convert pose encoding to extrinsic and intrinsic matrices
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
     extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
     predictions["extrinsic"] = extrinsic
     predictions["intrinsic"] = intrinsic
 
-    # Convert torch tensors in predictions -> numpy and remove batch dim where appropriate
+    # tensors -> numpy
     for key in list(predictions.keys()):
         v = predictions[key]
         if isinstance(v, torch.Tensor):
-            # keep same semantic as original: move to cpu, numpy, squeeze batch dim if present
             try:
-                arr = v.cpu().numpy()
-                # if first dimension is batch dim of size 1, remove it
+                arr = v.detach().cpu().numpy()
                 if arr.ndim > 0 and arr.shape[0] == 1:
                     arr = arr.squeeze(0)
                 predictions[key] = arr
             except Exception:
-                # fallback — keep as-is if conversion fails (shouldn't happen)
                 predictions[key] = v
 
-    # If pose_enc_list exists, remove it to keep smaller saved state (original code did this)
-    if "pose_enc_list" in predictions:
-        predictions["pose_enc_list"] = None
-
-    # --- PRINT and SAVE human-readable intrinsics & extrinsics ---
-    try:
-        np.set_printoptions(precision=6, suppress=True)
-        intr = predictions.get("intrinsic", None)
-        extr = predictions.get("extrinsic", None)
-
-        if intr is None or extr is None:
-            print("Warning: intrinsic or extrinsic not found in predictions.")
-        else:
-            # Determine number of cameras/frames available (handle shapes safely)
-            # intr shape: (S, 3, 3) or (S, ...) ; extr shape: (S, 4, 4) or similar
-            n_intr = intr.shape[0] if hasattr(intr, "shape") and len(intr.shape) >= 1 else 1
-            n_extr = extr.shape[0] if hasattr(extr, "shape") and len(extr.shape) >= 1 else 1
-            n_cams = min(n_intr, n_extr)
-
-            cam_txt_path = os.path.join(target_dir, "camera_params.txt")
-            lines = []
-            lines.append(f"VGGT camera parameters (generated {datetime.now().isoformat()})\n\n")
-
-            for i in range(n_cams):
-                lines.append(f"=== Camera {i} ===\n")
-                # Intrinsic matrix (K)
-                try:
-                    K = intr[i]
-                except Exception:
-                    K = intr  # fallback if intr not indexed
-                lines.append("Intrinsic (K):\n")
-                lines.append(np.array2string(np.array(K), separator=", "))
-                lines.append("\n")
-                # Extrinsic matrix
-                try:
-                    E = extr[i]
-                except Exception:
-                    E = extr
-                lines.append("Extrinsic (camera-from-world matrix):\n")
-                lines.append(np.array2string(np.array(E), separator=", "))
-                lines.append("\n\n")
-                # Print to console as well
-                print(f"--- Camera {i} ---")
-                print("K:\n", np.array(K))
-                print("Extrinsic:\n", np.array(E))
-
-            # Write to file
-            try:
-                with open(cam_txt_path, "w") as f:
-                    f.writelines(line if isinstance(line, str) else str(line) for line in lines)
-                print(f"Saved human-readable camera params to: {cam_txt_path}")
-            except Exception as e:
-                print("Failed to save camera params file:", e)
-    except Exception as e:
-        print("Error while preparing/saving camera params:", e)
-
-    # Generate world points from depth map (same as original)
+    # make world points from depth (best-effort)
     try:
         print("Computing world points from depth map...")
-        depth_map = predictions["depth"]  # expected shape (S, H, W, 1) or (S, H, W)
+        depth_map = predictions["depth"]
         world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
         predictions["world_points_from_depth"] = world_points
     except Exception as e:
         print("Warning: failed to compute world points from depth:", e)
-        # don't crash the whole pipeline; still return predictions (user can inspect camera file)
         predictions["world_points_from_depth"] = None
 
-    # final cleanup
     torch.cuda.empty_cache()
     return predictions
-
 
 
 # -------------------------------------------------------------------------
 # 2) Handle uploaded video/images --> produce target_dir + images
 # -------------------------------------------------------------------------
 def handle_uploads(input_video, input_images):
-    """
-    Create a new 'target_dir' + 'images' subfolder, and place user-uploaded
-    images or extracted frames from video into it. Return (target_dir, image_paths).
-    """
     start_time = time.time()
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Create a unique folder name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     target_dir = f"input_images_{timestamp}"
     target_dir_images = os.path.join(target_dir, "images")
 
-    # Clean up if somehow that folder already exists
     if os.path.exists(target_dir):
         shutil.rmtree(target_dir)
     os.makedirs(target_dir)
@@ -200,7 +272,7 @@ def handle_uploads(input_video, input_images):
 
     image_paths = []
 
-    # --- Handle images ---
+    # images
     if input_images is not None:
         for file_data in input_images:
             if isinstance(file_data, dict) and "name" in file_data:
@@ -211,17 +283,15 @@ def handle_uploads(input_video, input_images):
             shutil.copy(file_path, dst_path)
             image_paths.append(dst_path)
 
-    # --- Handle video ---
+    # video -> frames (1 fps)
     if input_video is not None:
         if isinstance(input_video, dict) and "name" in input_video:
             video_path = input_video["name"]
         else:
             video_path = input_video
-
         vs = cv2.VideoCapture(video_path)
         fps = vs.get(cv2.CAP_PROP_FPS)
-        frame_interval = int(fps * 1)  # 1 frame/sec
-
+        frame_interval = max(1, int(fps * 1))
         count = 0
         video_frame_num = 0
         while True:
@@ -235,7 +305,6 @@ def handle_uploads(input_video, input_images):
                 image_paths.append(image_path)
                 video_frame_num += 1
 
-    # Sort final images for gallery
     image_paths = sorted(image_paths)
 
     end_time = time.time()
@@ -247,11 +316,6 @@ def handle_uploads(input_video, input_images):
 # 3) Update gallery on upload
 # -------------------------------------------------------------------------
 def update_gallery_on_upload(input_video, input_images):
-    """
-    Whenever user uploads or changes files, immediately handle them
-    and show in the gallery. Return (target_dir, image_paths).
-    If nothing is uploaded, returns "None" and empty list.
-    """
     if not input_video and not input_images:
         return None, None, None, None
     target_dir, image_paths = handle_uploads(input_video, input_images)
@@ -263,25 +327,21 @@ def update_gallery_on_upload(input_video, input_images):
 # -------------------------------------------------------------------------
 def gradio_demo(
     target_dir,
-    conf_thres=3.0,
+    conf_thres=50.0,  # percent
     frame_filter="All",
     mask_black_bg=False,
     mask_white_bg=False,
     show_cam=True,
     mask_sky=False,
-    prediction_mode="Pointmap Regression",
+    prediction_mode="Depthmap and Camera Branch",
 ):
-    """
-    Perform reconstruction using the already-created target_dir/images.
-    """
     if not os.path.isdir(target_dir) or target_dir == "None":
-        return None, "No valid target directory found. Please upload first.", None, None
+        return None, "No valid target directory found. Please upload first.", None, None, None
 
     start_time = time.time()
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Prepare frame_filter dropdown
     target_dir_images = os.path.join(target_dir, "images")
     all_files = sorted(os.listdir(target_dir_images)) if os.path.isdir(target_dir_images) else []
     all_files = [f"{i}: {filename}" for i, filename in enumerate(all_files)]
@@ -291,21 +351,30 @@ def gradio_demo(
     with torch.no_grad():
         predictions = run_model(target_dir, model)
 
-    # Save predictions
+    # Save a lightweight predictions bundle (without images)
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
-    np.savez(prediction_save_path, **predictions)
+    np.savez_compressed(
+        prediction_save_path,
+        pose_enc=predictions.get("pose_enc", None),
+        depth=predictions.get("depth", None),
+        depth_conf=predictions.get("depth_conf", None),
+        world_points=predictions.get("world_points", None),
+        world_points_conf=predictions.get("world_points_conf", None),
+        extrinsic=predictions.get("extrinsic", None),
+        intrinsic=predictions.get("intrinsic", None),
+        world_points_from_depth=predictions.get("world_points_from_depth", None),
+    )
 
-    # Handle None frame_filter
     if frame_filter is None:
         frame_filter = "All"
 
-    # Build a GLB file name
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_"
+        f"maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_"
+        f"pred{prediction_mode.replace(' ', '_')}.glb",
     )
 
-    # Convert predictions to GLB
     glbscene = predictions_to_glb(
         predictions,
         conf_thres=conf_thres,
@@ -319,6 +388,9 @@ def gradio_demo(
     )
     glbscene.export(file_obj=glbfile)
 
+    # ---- NEW: export all data (no images) + zip ----
+    export_dir, zip_path = save_and_zip_results(target_dir, predictions, conf_thres_percent=float(conf_thres))
+
     # Cleanup
     del predictions
     gc.collect()
@@ -326,40 +398,25 @@ def gradio_demo(
 
     end_time = time.time()
     print(f"Total time: {end_time - start_time:.2f} seconds (including IO)")
-    log_msg = f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
+    log_msg = f"Reconstruction Success. Exported to:\n{export_dir}"
 
-    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
+    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True), export_dir, zip_path
 
 
 # -------------------------------------------------------------------------
 # 5) Helper functions for UI resets + re-visualization
 # -------------------------------------------------------------------------
 def clear_fields():
-    """
-    Clears the 3D viewer, the stored target_dir, and empties the gallery.
-    """
     return None
 
-
 def update_log():
-    """
-    Display a quick log message while waiting.
-    """
     return "Loading and Reconstructing..."
-
 
 def update_visualization(
     target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example
 ):
-    """
-    Reload saved predictions from npz, create (or reuse) the GLB for new parameters,
-    and return it for the 3D viewer. If is_example == "True", skip.
-    """
-
-    # If it's an example click, skip as requested
     if is_example == "True":
         return None, "No reconstruction available. Please click the Reconstruct button first."
-
     if not target_dir or target_dir == "None" or not os.path.isdir(target_dir):
         return None, "No reconstruction available. Please click the Reconstruct button first."
 
@@ -373,18 +430,19 @@ def update_visualization(
         "depth_conf",
         "world_points",
         "world_points_conf",
-        "images",
         "extrinsic",
         "intrinsic",
         "world_points_from_depth",
     ]
 
-    loaded = np.load(predictions_path)
-    predictions = {key: np.array(loaded[key]) for key in key_list}
+    loaded = np.load(predictions_path, allow_pickle=True)
+    predictions = {key: np.array(loaded[key]) if key in loaded else None for key in key_list}
 
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_"
+        f"maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_"
+        f"pred{prediction_mode.replace(' ', '_')}.glb",
     )
 
     if not os.path.exists(glbfile):
@@ -405,9 +463,8 @@ def update_visualization(
 
 
 # -------------------------------------------------------------------------
-# Example images
+# Example videos
 # -------------------------------------------------------------------------
-
 great_wall_video = "examples/videos/great_wall.mp4"
 colosseum_video = "examples/videos/Colosseum.mp4"
 room_video = "examples/videos/room.mp4"
@@ -440,7 +497,6 @@ with gr.Blocks(
         color: transparent !important;
         text-align: center !important;
     }
-    
     .example-log * {
         font-style: italic;
         font-size: 16px !important;
@@ -449,14 +505,12 @@ with gr.Blocks(
         background-clip: text;
         color: transparent !important;
     }
-    
     #my_radio .wrap {
         display: flex;
         flex-wrap: nowrap;
         justify-content: center;
         align-items: center;
     }
-
     #my_radio .wrap label {
         display: flex;
         width: 50%;
@@ -468,7 +522,6 @@ with gr.Blocks(
     }
     """,
 ) as demo:
-    # Instead of gr.State, we use a hidden Textbox:
     is_example = gr.Textbox(label="is_example", visible=False, value="None")
     num_images = gr.Textbox(label="num_images", visible=False, value="None")
 
@@ -476,40 +529,12 @@ with gr.Blocks(
         """
     <h1>🏛️ VGGT: Visual Geometry Grounded Transformer</h1>
     <p>
-    <a href="https://github.com/facebookresearch/vggt">🐙 GitHub Repository</a> |
-    <a href="#">Project Page</a>
+    <a href="https://github.com/facebookresearch/vggt">🐙 GitHub Repository</a>
     </p>
-
-    <div style="font-size: 16px; line-height: 1.5;">
-    <p>Upload a video or a set of images to create a 3D reconstruction of a scene or object. VGGT takes these images and generates a 3D point cloud, along with estimated camera poses.</p>
-
-    <h3>Getting Started:</h3>
-    <ol>
-        <li><strong>Upload Your Data:</strong> Use the "Upload Video" or "Upload Images" buttons on the left to provide your input. Videos will be automatically split into individual frames (one frame per second).</li>
-        <li><strong>Preview:</strong> Your uploaded images will appear in the gallery on the left.</li>
-        <li><strong>Reconstruct:</strong> Click the "Reconstruct" button to start the 3D reconstruction process.</li>
-        <li><strong>Visualize:</strong> The 3D reconstruction will appear in the viewer on the right. You can rotate, pan, and zoom to explore the model, and download the GLB file. Note the visualization of 3D points may be slow for a large number of input images.</li>
-        <li>
-        <strong>Adjust Visualization (Optional):</strong>
-        After reconstruction, you can fine-tune the visualization using the options below
-        <details style="display:inline;">
-            <summary style="display:inline;">(<strong>click to expand</strong>):</summary>
-            <ul>
-            <li><em>Confidence Threshold:</em> Adjust the filtering of points based on confidence.</li>
-            <li><em>Show Points from Frame:</em> Select specific frames to display in the point cloud.</li>
-            <li><em>Show Camera:</em> Toggle the display of estimated camera positions.</li>
-            <li><em>Filter Sky / Filter Black Background:</em> Remove sky or black-background points.</li>
-            <li><em>Select a Prediction Mode:</em> Choose between "Depthmap and Camera Branch" or "Pointmap Branch."</li>
-            </ul>
-        </details>
-        </li>
-    </ol>
-    <p><strong style="color: #0ea5e9;">Please note:</strong> <span style="color: #0ea5e9; font-weight: bold;">VGGT typically reconstructs a scene in less than 1 second. However, visualizing 3D points may take tens of seconds due to third-party rendering, which are independent of VGGT's processing time. </span></p>
-    </div>
     """
     )
 
-    target_dir_output = gr.Textbox(label="Target Dir", visible=False, value="None")
+    target_dir_output = gr.Textbox(label="Target Dir", visible=True, value="None")
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -558,6 +583,10 @@ with gr.Blocks(
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
 
+            # NEW: Export outputs (folder + zip)
+            export_folder_tb = gr.Textbox(label="Export Folder", interactive=False)
+            export_zip_file  = gr.File(label="Download ZIP", interactive=False)
+
     # ---------------------- Examples section ----------------------
     examples = [
         [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
@@ -573,26 +602,20 @@ with gr.Blocks(
         input_video,
         num_images_str,
         input_images,
-        conf_thres,
-        mask_black_bg,
-        mask_white_bg,
-        show_cam,
-        mask_sky,
-        prediction_mode,
+        conf_thres_v,
+        mask_black_bg_v,
+        mask_white_bg_v,
+        show_cam_v,
+        mask_sky_v,
+        prediction_mode_v,
         is_example_str,
     ):
-        """
-        1) Copy example images to new target_dir
-        2) Reconstruct
-        3) Return model3D + logs + new_dir + updated dropdown + gallery
-        We do NOT return is_example. It's just an input.
-        """
         target_dir, image_paths = handle_uploads(input_video, input_images)
-        # Always use "All" for frame_filter in examples
-        frame_filter = "All"
-        glbfile, log_msg, dropdown = gradio_demo(
-            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
+        frame_filter_v = "All"
+        glbfile, log_msg, dropdown, export_dir, zip_path = gradio_demo(
+            target_dir, conf_thres_v, frame_filter_v, mask_black_bg_v, mask_white_bg_v, show_cam_v, mask_sky_v, prediction_mode_v
         )
+        # We only return the five outputs the Examples component expects:
         return glbfile, log_msg, target_dir, dropdown, image_paths
 
     gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
@@ -618,11 +641,7 @@ with gr.Blocks(
     )
 
     # -------------------------------------------------------------------------
-    # "Reconstruct" button logic:
-    #  - Clear fields
-    #  - Update log
-    #  - gradio_demo(...) with the existing target_dir
-    #  - Then set is_example = "False"
+    # "Reconstruct" button logic
     # -------------------------------------------------------------------------
     submit_btn.click(fn=clear_fields, inputs=[], outputs=[reconstruction_output]).then(
         fn=update_log, inputs=[], outputs=[log_output]
@@ -638,119 +657,30 @@ with gr.Blocks(
             mask_sky,
             prediction_mode,
         ],
-        outputs=[reconstruction_output, log_output, frame_filter],
+        outputs=[reconstruction_output, log_output, frame_filter, export_folder_tb, export_zip_file],
     ).then(
-        fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
+        fn=lambda: "False", inputs=[], outputs=[is_example]
     )
 
     # -------------------------------------------------------------------------
     # Real-time Visualization Updates
     # -------------------------------------------------------------------------
-    conf_thres.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    frame_filter.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    mask_black_bg.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    mask_white_bg.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    show_cam.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    mask_sky.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    prediction_mode.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
+    for comp in (conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode):
+        comp.change(
+            update_visualization,
+            [
+                target_dir_output,
+                conf_thres,
+                frame_filter,
+                mask_black_bg,
+                mask_white_bg,
+                show_cam,
+                mask_sky,
+                prediction_mode,
+                is_example,
+            ],
+            [reconstruction_output, log_output],
+        )
 
     # -------------------------------------------------------------------------
     # Auto-update gallery whenever user uploads or changes their files
