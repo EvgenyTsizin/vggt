@@ -43,26 +43,17 @@ model = model.to(device)
 # -------------------------------------------------------------------------
 def save_and_zip_results(target_dir: str, predictions: dict, conf_thres_percent: float = 50.0):
     """
-    Save full reconstruction results (excluding images) into <target_dir>/export/
-    and zip them. Returns (export_dir, zip_path).
+    Export with XYZRGB + camera index:
+      points.npy : Nx7 float32 as [x,y,z,r,g,b,cam_idx]
+      points.ply : ASCII PLY with per-vertex RGB and camera_index
+    Also saves cameras (json/npz), depth/conf, meta bundle, and a ZIP of export/.
 
-    Saved content:
-      export/
-        cameras/
-          cameras.npz            # intrinsic, extrinsic
-          camera_params.txt      # human-readable
-          cameras.json           # JSON copy (quick view)
-        depth/
-          depth_XXXX.npy         # per-frame depth (float32)
-          conf_XXXX.npy          # per-frame depth confidence (float32)
-          depth_meta.json        # shape info + stats
-        points/
-          points.ply             # point cloud (geometry-only)
-          points.npy             # Nx3 numpy array (float32)
-        meta/
-          results.npz            # full predictions (intrinsic, extrinsic, depth, depth_conf, world_points_from_depth)
-          summary.json           # sizes, counts, thresholds used
+    Required predictions keys:
+      intrinsic:(S,3,3), extrinsic:(S,3,4),
+      depth:(S,H,W) or (S,H,W,1), depth_conf:(S,H,W) [optional],
+      world_points_from_depth:(S,H,W,3)
     """
+    
     target_dir = str(target_dir)
     export_dir = os.path.join(target_dir, "export")
     cams_dir   = os.path.join(export_dir, "cameras")
@@ -72,129 +63,186 @@ def save_and_zip_results(target_dir: str, predictions: dict, conf_thres_percent:
     for d in (cams_dir, depth_dir, points_dir, meta_dir):
         os.makedirs(d, exist_ok=True)
 
-    # --- grab arrays safely ---
-    K = predictions.get("intrinsic", None)
-    E = predictions.get("extrinsic", None)
-    depth = predictions.get("depth", None)                  # [S,H,W] or [S,H,W,1]
-    depth_conf = predictions.get("depth_conf", None)        # [S,H,W]
-    wp = predictions.get("world_points_from_depth", None)   # [S,H,W,3] if present
+    K  = predictions.get("intrinsic", None)
+    E  = predictions.get("extrinsic", None)
+    D  = predictions.get("depth", None)
+    C  = predictions.get("depth_conf", None)
+    WP = predictions.get("world_points_from_depth", None)
+    if K is None or E is None or WP is None:
+        raise ValueError("Missing intrinsic/extrinsic/world_points_from_depth in predictions.")
 
-    # --- normalize shapes ---
-    if depth is not None:
-        depth = np.array(depth)
-        if depth.ndim == 4 and depth.shape[-1] == 1:
-            depth = depth[..., 0]
-        depth = depth.astype(np.float32, copy=False)
+    K = np.array(K)
+    E = np.array(E)
+    WP = np.array(WP)               # (S,H,W,3)
+    if D is not None:
+        D = np.array(D)
+        if D.ndim == 4 and D.shape[-1] == 1:
+            D = D[..., 0]
+        D = D.astype(np.float32, copy=False)
+    if C is not None:
+        C = np.array(C, dtype=np.float32)
 
-    if depth_conf is not None:
-        depth_conf = np.array(depth_conf).astype(np.float32, copy=False)
+    S, H, W = WP.shape[:3]
 
-    # --- cameras: save npz, txt, json ---
-    cam_npz = os.path.join(cams_dir, "cameras.npz")
-    np.savez(cam_npz, intrinsic=np.array(K), extrinsic=np.array(E))
+    # Cameras
+    np.savez(os.path.join(cams_dir, "cameras.npz"), intrinsic=K, extrinsic=E)
+    with open(os.path.join(cams_dir, "cameras.json"), "w") as f:
+        json.dump({"intrinsic": K.tolist(), "extrinsic": E.tolist()}, f, indent=2)
+    with open(os.path.join(cams_dir, "camera_params.json"), "w") as f:
+        json.dump(
+            {
+                "intrinsic": K.tolist(),
+                "extrinsic": E.tolist(),
+                "description": "Camera parameters per view: intrinsic K and extrinsic [R|t] (camera-from-world).",
+            },
+            f,
+            indent=2,
+        )
 
-    cam_txt = os.path.join(cams_dir, "camera_params.txt")
-    with open(cam_txt, "w") as f:
-        f.write("=== Intrinsic (K) ===\n")
-        f.write(repr(np.array(K)) + "\n\n")
-        f.write("=== Extrinsic (camera-from-world) ===\n")
-        f.write(repr(np.array(E)) + "\n")
-
-    cam_json = os.path.join(cams_dir, "cameras.json")
-    with open(cam_json, "w") as f:
-        json.dump({
-            "intrinsic": np.array(K).tolist() if K is not None else None,
-            "extrinsic": np.array(E).tolist() if E is not None else None
-        }, f, indent=2)
-
-    # --- depth: save per-frame .npy + meta ---
-    if depth is not None:
-        S = depth.shape[0]
+    # Depth / conf / meta
+    if D is not None:
         for i in range(S):
-            np.save(os.path.join(depth_dir, f"depth_{i:04d}.npy"), depth[i])
-        depth_min = float(np.nanmin(depth)) if depth.size else None
-        depth_max = float(np.nanmax(depth)) if depth.size else None
-        depth_mean = float(np.nanmean(depth)) if depth.size else None
+            np.save(os.path.join(depth_dir, f"depth_{i:04d}.npy"), D[i])
+    if C is not None:
+        for i in range(S):
+            np.save(os.path.join(depth_dir, f"conf_{i:04d}.npy"), C[i])
+    depth_meta = {
+        "frames": int(S),
+        "shape_per_frame": list(D.shape[1:]) if D is not None else [H, W],
+        "stats": None if D is None else {
+            "min": float(np.nanmin(D)) if D.size else None,
+            "max": float(np.nanmax(D)) if D.size else None,
+            "mean": float(np.nanmean(D)) if D.size else None,
+        },
+    }
+    with open(os.path.join(depth_dir, "depth_meta.json"), "w") as f:
+        json.dump(depth_meta, f, indent=2)
 
-        if depth_conf is not None and depth_conf.shape[:3] == depth.shape[:3]:
-            for i in range(S):
-                np.save(os.path.join(depth_dir, f"conf_{i:04d}.npy"), depth_conf[i])
+    # Build RGB aligned to depth (S,H,W,3) from input images
+    images_dir = os.path.join(target_dir, "images")
+    img_files = sorted(os.listdir(images_dir)) if os.path.isdir(images_dir) else []
+    rgb_stack = None
+    if len(img_files) >= S:
+        rgb_list = []
+        for i in range(S):
+            p = os.path.join(images_dir, img_files[i])
+            im_bgr = cv2.imread(p, cv2.IMREAD_COLOR)
+            if im_bgr is None:
+                im_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+            else:
+                im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
+                if (im_rgb.shape[0], im_rgb.shape[1]) != (H, W):
+                    im_rgb = cv2.resize(im_rgb, (W, H), interpolation=cv2.INTER_LINEAR)
+            rgb_list.append(im_rgb)
+        rgb_stack = np.stack(rgb_list, axis=0).astype(np.uint8)  # (S,H,W,3)
 
-        with open(os.path.join(depth_dir, "depth_meta.json"), "w") as f:
-            json.dump({
-                "frames": int(S),
-                "shape_per_frame": list(depth.shape[1:]),
-                "stats": {"min": depth_min, "max": depth_max, "mean": depth_mean}
-            }, f, indent=2)
+    # Confidence threshold (global percentile)
+    conf_mask_flat = None
+    if C is not None and C.shape[:3] == (S, H, W):
+        conf_all = C.reshape(-1)
+        valid_conf = conf_all[np.isfinite(conf_all)]
+        if valid_conf.size > 0:
+            th = np.percentile(valid_conf, conf_thres_percent)
+            conf_mask_flat = conf_all >= th
 
-    # --- points: build from world_points_from_depth if present ---
-    pts_npy_path = os.path.join(points_dir, "points.npy")
-    pts_ply_path = os.path.join(points_dir, "points.ply")
-    saved_points = False
-    if wp is not None:
-        wp = np.array(wp)
-        pts = wp.reshape(-1, 3)
-        mask = np.isfinite(pts).all(axis=1)
-        if depth_conf is not None and depth is not None:
-            conf = depth_conf.reshape(-1)
-            valid_conf = conf[np.isfinite(conf)]
-            if valid_conf.size > 0:
-                th = np.percentile(valid_conf, conf_thres_percent)
-                mask &= (conf >= th)
-        pts = pts[mask]
-        # store numpy
-        np.save(pts_npy_path, pts.astype(np.float32, copy=False))
-        # write PLY
-        try:
-            import trimesh
-            trimesh.PointCloud(pts.astype(np.float32, copy=False)).export(pts_ply_path)
-            saved_points = True
-        except Exception:
-            # simple ASCII PLY fallback
-            try:
-                with open(pts_ply_path, "w") as f:
-                    f.write("ply\nformat ascii 1.0\nelement vertex {}\n".format(pts.shape[0]))
-                    f.write("property float x\nproperty float y\nproperty float z\nend_header\n")
-                    for p in pts:
-                        f.write(f"{p[0]} {p[1]} {p[2]}\n")
-                saved_points = True
-            except Exception:
-                saved_points = False
+    # Assemble XYZRGB + cam_idx
+    pts_list = []
+    rgb_list = []
+    idx_list = []
 
-    # --- meta: full NPZ & summary ---
+    for i in range(S):
+        xyz = WP[i].reshape(-1, 3)
+        finite = np.isfinite(xyz).all(axis=1)
+        mask = finite
+        if conf_mask_flat is not None:
+            start = i * (H * W)
+            mask &= conf_mask_flat[start:start + H * W]
+
+        if not np.any(mask):
+            continue
+
+        xyz = xyz[mask]
+
+        if rgb_stack is not None:
+            rgb_flat = rgb_stack[i].reshape(-1, 3)[mask]          # uint8
+        else:
+            rgb_flat = np.zeros((xyz.shape[0], 3), dtype=np.uint8) # fallback
+
+        cam_idx = np.full((xyz.shape[0], 1), i, dtype=np.int32)
+
+        pts_list.append(xyz.astype(np.float32, copy=False))
+        rgb_list.append(rgb_flat.astype(np.uint8, copy=False))
+        idx_list.append(cam_idx)
+
+    if len(pts_list) == 0:
+        # still write empty outputs
+        np.save(os.path.join(points_dir, "points.npy"), np.zeros((0,7), dtype=np.float32))
+        with open(os.path.join(points_dir, "points.ply"), "w") as f:
+            f.write("ply\nformat ascii 1.0\nelement vertex 0\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("property int camera_index\nend_header\n")
+    else:
+        XYZ = np.concatenate(pts_list, axis=0)                    # (N,3) float32
+        RGB = np.concatenate(rgb_list, axis=0)                    # (N,3) uint8
+        CAM = np.concatenate(idx_list, axis=0)                    # (N,1) int32
+
+        # points.npy: Nx7 float32 [x,y,z,r,g,b,cam_idx]
+        pts_npy = np.concatenate(
+            [XYZ.astype(np.float32, copy=False),
+             RGB.astype(np.float32, copy=False),
+             CAM.astype(np.float32, copy=False)],
+            axis=1
+        )
+        np.save(os.path.join(points_dir, "points.npy"), pts_npy)
+
+        # points.ply: ASCII with RGB + camera_index
+        ply_path = os.path.join(points_dir, "points.ply")
+        with open(ply_path, "w") as f:
+            n = XYZ.shape[0]
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {n}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("property int camera_index\n")
+            f.write("end_header\n")
+            for (x, y, z), (r, g, b), (ci,) in zip(XYZ, RGB, CAM):
+                f.write(f"{x} {y} {z} {int(r)} {int(g)} {int(b)} {int(ci)}\n")
+
+    # Meta bundle + summary
     results_npz = os.path.join(meta_dir, "results.npz")
     np.savez_compressed(
         results_npz,
-        intrinsic=np.array(K) if K is not None else None,
-        extrinsic=np.array(E) if E is not None else None,
-        depth=depth if depth is not None else None,
-        depth_conf=depth_conf if depth_conf is not None else None,
-        world_points_from_depth=np.array(wp) if wp is not None else None
+        intrinsic=K,
+        extrinsic=E,
+        depth=D if D is not None else None,
+        depth_conf=C if C is not None else None,
+        world_points_from_depth=WP
     )
-
+    points_npy_path = os.path.join(points_dir, "points.npy")
     summary = {
         "export_dir": export_dir,
         "saved": {
-            "cameras_npz": cam_npz,
-            "camera_params_txt": cam_txt,
-            "cameras_json": cam_json,
-            "depth_dir": depth_dir if depth is not None else None,
-            "points_ply": pts_ply_path if saved_points else None,
-            "points_npy": pts_npy_path if os.path.exists(pts_npy_path) else None,
-            "results_npz": results_npz
+            "cameras_npz": os.path.join(cams_dir, "cameras.npz"),
+            "cameras_json": os.path.join(cams_dir, "cameras.json"),
+            "camera_params_json": os.path.join(cams_dir, "camera_params.json"),
+            "depth_dir": depth_dir,
+            "points_npy": points_npy_path if os.path.exists(points_npy_path) else None,
+            "points_ply": os.path.join(points_dir, "points.ply"),
+            "results_npz": results_npz,
         },
-        "thresholds": {
-            "conf_thres_percent": conf_thres_percent
-        }
+        "points_npy_shape": list(np.load(points_npy_path).shape) if os.path.exists(points_npy_path) else [0, 7],
+        "schema_points_npy": "[x,y,z,r,g,b,cam_idx] (float32; RGB 0..255; cam_idx int cast to float32)",
+        "frames": int(S),
+        "depth_size": [int(H), int(W)],
+        "conf_thres_percent": float(conf_thres_percent),
     }
     with open(os.path.join(meta_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
-    # --- zip it ---
     zip_base = os.path.join(target_dir, os.path.basename(target_dir) + "_export")
     zip_path = shutil.make_archive(zip_base, "zip", root_dir=export_dir)
     return export_dir, zip_path
-
 
 # -------------------------------------------------------------------------
 # 1) Core model inference
